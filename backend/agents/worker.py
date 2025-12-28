@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-
 from .llm import chat_complete
 from .prompts import build_prompts
 
@@ -147,7 +146,7 @@ def _md_to_html(md: str, title: str = "Report") -> str:
 
 
 # ---------------------------
-# Templates (fallback)
+# Fallback templates (если LLM недоступен)
 # ---------------------------
 def _site_html_fallback(goal: str) -> str:
     title = "Landing Page"
@@ -222,18 +221,6 @@ def _analytics_md_fallback(goal: str) -> str:
 """
 
 
-def _meta(task_id: str, goal: str, mode: Dict[str, Any], artifacts: Dict[str, Any], llm_used: bool) -> Dict[str, Any]:
-    return {
-        "task_id": task_id,
-        "goal": goal,
-        "mode": mode,
-        "generated_at": time.time(),
-        "artifacts": artifacts,
-        "llm_used": llm_used,
-        "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-    }
-
-
 def _llm_enabled() -> bool:
     """
     Можно выключить LLM, если нужно:
@@ -247,6 +234,25 @@ def _llm_enabled() -> bool:
 def _looks_like_html(text: str) -> bool:
     t = (text or "").lower()
     return "<html" in t and "</html>" in t
+
+
+def _meta(
+    task_id: str,
+    goal: str,
+    mode: Dict[str, Any],
+    artifacts: Dict[str, Any],
+    llm_used: bool,
+    model: str,
+) -> Dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "goal": goal,
+        "mode": mode,
+        "generated_at": time.time(),
+        "artifacts": artifacts,
+        "llm_used": llm_used,
+        "model": model,
+    }
 
 
 # ---------------------------
@@ -264,85 +270,77 @@ def worker_generate_artifacts(task: Dict[str, Any]) -> Dict[str, Any]:
         mode = {}
 
     product = (mode.get("product") or "site").strip().lower()
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
     out_dir = _reports_dir(task_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     artifacts: Dict[str, Any] = {}
-    llm_used = False
 
-    # 1) строим промпты (это делает prompts.py реально используемым)
+    # 1) Промпты
     prompts = build_prompts(task)
 
-    # 2) Если LLM включён, пробуем получить результат от модели
+    # 2) Пробуем LLM (если включен)
     llm_text = None
+    llm_used = False
     if _llm_enabled():
         llm_text = chat_complete(
             system=prompts.worker_system,
             user=prompts.worker_user,
         )
-        llm_used = bool(llm_text)
+        llm_used = bool(llm_text and llm_text.strip())
+
+    # Пишем “служебные” поля прямо в artifacts (чтобы UI мог показать без чтения файла)
+    artifacts["_llm_used"] = llm_used
+    artifacts["_model"] = model
 
     # -----------------------
     # SITE / VISUAL -> ожидаем HTML
     # -----------------------
     if product in ("site", "visual"):
-        html = None
-
         if llm_text and _looks_like_html(llm_text):
-            html = llm_text
+            html = llm_text.strip()
         else:
-            # fallback на шаблон, если LLM вернул не-HTML или был недоступен
             html = _site_html_fallback(goal)
 
-        rel = f"reports/{task_id}/result.html"
-        artifacts["result_html"] = _write_text(rel, html)
-
+        artifacts["result_html"] = _write_text(f"reports/{task_id}/result.html", html)
         artifacts["meta_json"] = _write_json(
             f"reports/{task_id}/meta.json",
-            _meta(task_id, goal, mode, artifacts, llm_used=llm_used),
+            _meta(task_id, goal, mode, artifacts, llm_used=llm_used, model=model),
         )
         return artifacts
 
     # -----------------------
-    # ANALYTICS -> ожидаем markdown, затем делаем HTML
+    # ANALYTICS -> ожидаем markdown, затем HTML
     # -----------------------
     if product == "analytics":
-        md = None
-
-        # Если LLM вернул что-то — используем как markdown (даже если там нет #, reviewer потом проверит)
         if llm_text and len(llm_text.strip()) > 50:
             md = llm_text.strip()
         else:
             md = _analytics_md_fallback(goal)
 
-        report_md_rel = f"reports/{task_id}/report.md"
-        artifacts["report_md"] = _write_text(report_md_rel, md)
-
-        html = _md_to_html(md, title="Analytics Report")
-        result_html_rel = f"reports/{task_id}/result.html"
-        artifacts["result_html"] = _write_text(result_html_rel, html)
-
+        artifacts["report_md"] = _write_text(f"reports/{task_id}/report.md", md)
+        artifacts["result_html"] = _write_text(
+            f"reports/{task_id}/result.html",
+            _md_to_html(md, title="Analytics Report"),
+        )
         artifacts["meta_json"] = _write_json(
             f"reports/{task_id}/meta.json",
-            _meta(task_id, goal, mode, artifacts, llm_used=llm_used),
+            _meta(task_id, goal, mode, artifacts, llm_used=llm_used, model=model),
         )
         return artifacts
 
     # -----------------------
-    # CODE -> пока стабильный детерминированный шаблон (можно расширить позже)
+    # CODE -> стабильный шаблон (LLM можно расширить позже)
     # -----------------------
     if product == "code":
         proj_dir = out_dir / "project"
         proj_dir.mkdir(parents=True, exist_ok=True)
 
-        # Небольшая попытка улучшить контент LLM-ом (если он доступен),
-        # но если что — fallback на простые файлы, чтобы не ломать MVP.
         readme_text = f"# Project\n\nGoal: {goal}\n\nGenerated by AgentHub.\n"
         main_py_text = 'print("Hello from AgentHub project")\n'
 
         if llm_text and len(llm_text.strip()) > 80:
-            # Не пытаемся парсить сложный формат, просто добавим как "notes"
             readme_text = f"# Project\n\nGoal: {goal}\n\n## Notes from LLM\n\n{llm_text.strip()}\n"
 
         (proj_dir / "README.md").write_text(readme_text, encoding="utf-8")
@@ -351,28 +349,30 @@ def worker_generate_artifacts(task: Dict[str, Any]) -> Dict[str, Any]:
         md = f"# Code Project\n\nСгенерирована папка `reports/{task_id}/project/`.\n\n- README.md\n- main.py\n"
         artifacts["project_dir"] = f"reports/{task_id}/project"
         artifacts["report_md"] = _write_text(f"reports/{task_id}/report.md", md)
-        artifacts["result_html"] = _write_text(f"reports/{task_id}/result.html", _md_to_html(md, title="Code Project"))
-
+        artifacts["result_html"] = _write_text(
+            f"reports/{task_id}/result.html",
+            _md_to_html(md, title="Code Project"),
+        )
         artifacts["meta_json"] = _write_json(
             f"reports/{task_id}/meta.json",
-            _meta(task_id, goal, mode, artifacts, llm_used=llm_used),
+            _meta(task_id, goal, mode, artifacts, llm_used=llm_used, model=model),
         )
         return artifacts
 
     # неизвестный product → fallback в site
-    html = _site_html_fallback(goal)
-    artifacts["result_html"] = _write_text(f"reports/{task_id}/result.html", html)
+    artifacts["result_html"] = _write_text(f"reports/{task_id}/result.html", _site_html_fallback(goal))
     artifacts["meta_json"] = _write_json(
         f"reports/{task_id}/meta.json",
-        _meta(task_id, goal, mode, artifacts, llm_used=llm_used),
+        _meta(task_id, goal, mode, artifacts, llm_used=llm_used, model=model),
     )
     return artifacts
 
 
 def worker_fix_artifacts(task: Dict[str, Any], review_report: Dict[str, Any]) -> Dict[str, Any]:
     """
-    MVP авто-фиксер: если reviewer просит добавить секции в analytics — добавляем шаблонно.
-    Для site/code пока фиксы минимальные: просто регенерим.
+    MVP авто-фиксер:
+    - для analytics добавляет недостающие секции
+    - для остальных типов — регенерирует артефакты (там LLM тоже может участвовать)
     """
     task_id = task.get("task_id")
     goal = task.get("goal") or ""
@@ -381,16 +381,18 @@ def worker_fix_artifacts(task: Dict[str, Any], review_report: Dict[str, Any]) ->
         mode = {}
 
     product = (mode.get("product") or "site").strip().lower()
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
     artifacts = task.get("artifacts") or {}
     if not isinstance(artifacts, dict):
         artifacts = {}
 
     if product != "analytics":
-        # Для site/code/visual — просто пересоберём (там LLM тоже может участвовать)
         return worker_generate_artifacts(task)
 
     report_md_rel = artifacts.get("report_md") or f"reports/{task_id}/report.md"
     abs_md = _repo_root() / str(report_md_rel)
+
     if abs_md.exists():
         md = abs_md.read_text(encoding="utf-8")
     else:
@@ -417,6 +419,11 @@ def worker_fix_artifacts(task: Dict[str, Any], review_report: Dict[str, Any]) ->
             msg = str(it.get("msg") or it)
             fixed += f"- {msg}\n"
 
+    # При фиксе LLM не используем специально: фиксер детерминированный
+    llm_used = False
+    artifacts["_llm_used"] = llm_used
+    artifacts["_model"] = model
+
     artifacts["report_md"] = _write_text(report_md_rel, fixed)
     artifacts["result_html"] = _write_text(
         f"reports/{task_id}/result.html",
@@ -424,6 +431,6 @@ def worker_fix_artifacts(task: Dict[str, Any], review_report: Dict[str, Any]) ->
     )
     artifacts["meta_json"] = _write_json(
         f"reports/{task_id}/meta.json",
-        _meta(task_id, goal, mode, artifacts, llm_used=False),
+        _meta(task_id, goal, mode, artifacts, llm_used=llm_used, model=model),
     )
     return artifacts
