@@ -1,139 +1,429 @@
+from __future__ import annotations
+
+import json
+import os
 import time
-import uuid
-from datetime import datetime, timezone, timedelta
-import requests
-
-BASE_URL = "http://127.0.0.1:8000"
-POLL_INTERVAL_SEC = 2
-
-AGENT_ID = f"worker-{uuid.uuid4().hex[:8]}"
-LEASE_SECONDS = 60
+from pathlib import Path
+from typing import Any, Dict, List
 
 
-def utc_ts() -> float:
-    return datetime.now(timezone.utc).timestamp()
+from .llm import chat_complete
+from .prompts import build_prompts
 
 
-def lease_until_ts() -> float:
-    return (datetime.now(timezone.utc) + timedelta(seconds=LEASE_SECONDS)).timestamp()
+def _repo_root() -> Path:
+    # backend/agents/worker.py -> repo_root
+    return Path(__file__).resolve().parents[2]
 
 
-def get_state() -> dict:
-    r = requests.get(f"{BASE_URL}/state", timeout=10)
-    r.raise_for_status()
-    return r.json()
+def _reports_dir(task_id: str) -> Path:
+    return _repo_root() / "reports" / task_id
 
 
-def patch_state(patch: dict) -> dict:
-    r = requests.post(f"{BASE_URL}/patch", json={"patch": patch}, timeout=10)
-    r.raise_for_status()
-    return r.json()
+def _write_text(rel_path: str, content: str) -> str:
+    """
+    Пишем текст в repo_root/<rel_path>
+    Возвращаем нормализованный относительный путь (для artifacts).
+    """
+    abs_path = _repo_root() / rel_path
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_text(content, encoding="utf-8")
+    return str(Path(rel_path)).replace("\\", "/")
 
 
-def add_event(event: dict) -> dict:
-    r = requests.post(f"{BASE_URL}/event", json={"event": event}, timeout=10)
-    r.raise_for_status()
-    return r.json()
+def _write_json(rel_path: str, obj: Dict[str, Any]) -> str:
+    return _write_text(rel_path, json.dumps(obj, ensure_ascii=False, indent=2))
 
 
-def is_claimable(task: dict, now: float) -> bool:
-    if task.get("status") != "pending":
-        return False
-    owner = task.get("owner")
-    lease_until = task.get("lease_until")
-    if owner in (None, "", "null"):
-        return True
-    if lease_until is None:
-        return True
-    try:
-        return float(lease_until) < now
-    except Exception:
-        return True
+# ---------------------------
+# Simple Markdown -> HTML
+# ---------------------------
+def _escape_html(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
-def claim_one_task(state: dict) -> dict | None:
-    tasks = state.get("tasks", [])
-    now = utc_ts()
+def _md_to_html(md: str, title: str = "Report") -> str:
+    """
+    Мини-рендер Markdown в HTML (без внешних зависимостей).
+    Поддержка:
+      - # ## ### заголовки
+      - списки "- " / "* "
+      - ``` code blocks
+      - обычные абзацы
+    """
+    lines = md.splitlines()
+    out: List[str] = []
+    in_code = False
+    in_ul = False
 
-    for i, t in enumerate(tasks):
-        if t.get("type") == "work" and is_claimable(t, now):
-            tasks[i]["owner"] = AGENT_ID
-            tasks[i]["claimed_at"] = now
-            tasks[i]["lease_until"] = lease_until_ts()
-            tasks[i]["status"] = "in_progress"
+    def close_ul():
+        nonlocal in_ul
+        if in_ul:
+            out.append("</ul>")
+            in_ul = False
 
-            patch_state({"tasks": tasks})
+    for raw in lines:
+        line = raw.rstrip("\n")
 
-            add_event({
-                "type": "worker_claimed",
-                "agent_id": AGENT_ID,
-                "ts": now,
-                "task_id": t.get("task_id"),
-            })
+        if line.strip().startswith("```"):
+            close_ul()
+            if not in_code:
+                in_code = True
+                out.append("<pre><code>")
+            else:
+                in_code = False
+                out.append("</code></pre>")
+            continue
 
-            return tasks[i]
+        if in_code:
+            out.append(_escape_html(line))
+            continue
 
-    return None
+        if line.startswith("### "):
+            close_ul()
+            out.append(f"<h3>{_escape_html(line[4:])}</h3>")
+            continue
+        if line.startswith("## "):
+            close_ul()
+            out.append(f"<h2>{_escape_html(line[3:])}</h2>")
+            continue
+        if line.startswith("# "):
+            close_ul()
+            out.append(f"<h1>{_escape_html(line[2:])}</h1>")
+            continue
+
+        if line.strip().startswith(("- ", "* ")):
+            if not in_ul:
+                out.append("<ul>")
+                in_ul = True
+            out.append(f"<li>{_escape_html(line.strip()[2:])}</li>")
+            continue
+
+        if not line.strip():
+            close_ul()
+            out.append("<div style='height:10px'></div>")
+            continue
+
+        close_ul()
+        out.append(f"<p>{_escape_html(line)}</p>")
+
+    close_ul()
+
+    body = "\n".join(out)
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>{_escape_html(title)}</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background:#fff; color:#111; }}
+    .wrap {{ max-width: 980px; margin: 0 auto; padding: 44px 18px 70px; }}
+    h1 {{ font-size: 36px; margin: 0 0 12px; }}
+    h2 {{ margin-top: 26px; }}
+    h3 {{ margin-top: 18px; }}
+    p {{ line-height: 1.55; }}
+    pre {{ background:#0b1020; color:#dfe6ff; padding:14px; border-radius:14px; overflow:auto; }}
+    code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
+    ul {{ padding-left: 20px; }}
+    .meta {{ color:#666; font-size: 13px; margin-top: 10px; }}
+    .card {{ border:1px solid #e6e6e6; border-radius: 14px; padding: 18px; margin-top: 16px; background:#fafafa; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      {body}
+      <div class="meta">Сгенерировано AgentHub (markdown → html)</div>
+    </div>
+  </div>
+</body>
+</html>"""
 
 
-def complete_task(state: dict, task_id: str, result: dict):
-    tasks = state.get("tasks", [])
-    now = utc_ts()
-
-    for i, t in enumerate(tasks):
-        if t.get("task_id") == task_id:
-            tasks[i]["status"] = "done"
-            tasks[i]["lease_until"] = None
-            tasks[i]["result"] = result
-            patch_state({"tasks": tasks})
-
-            add_event({
-                "type": "worker_done",
-                "agent_id": AGENT_ID,
-                "ts": now,
-                "task_id": task_id,
-            })
-            return
-
-
-def worker_loop():
-    print(f"[worker] started, agent_id={AGENT_ID}", flush=True)
-
-    while True:
-        try:
-            state = get_state()
-            task = claim_one_task(state)
-
-            if not task:
-                print("[worker] No claimable tasks. Waiting...", flush=True)
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            tid = task.get("task_id")
-            print(f"[worker] Working on {tid} ...", flush=True)
-
-            # FAKE EXECUTION (2 секунды работы)
-            time.sleep(2)
-
-            # Простейший результат-заглушка
-            result = {
-                "ok": True,
-                "note": "Stub result: worker executed task (no AI yet).",
-                "task_id": tid,
-                "finished_at": utc_ts(),
-            }
-
-            # перечитываем state перед записью результата (на всякий)
-            state2 = get_state()
-            complete_task(state2, tid, result)
-
-        except Exception as e:
-            print(f"[worker] error: {e}", flush=True)
-            time.sleep(POLL_INTERVAL_SEC)
+# ---------------------------
+# Templates (fallback)
+# ---------------------------
+def _site_html_fallback(goal: str) -> str:
+    title = "Landing Page"
+    subtitle = goal.strip() or "Minimal landing page"
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:0; background:#fff; color:#111; }}
+    .wrap {{ max-width: 980px; margin: 0 auto; padding: 48px 18px; }}
+    .hero {{ padding: 56px 28px; border-radius: 16px; background: #111; color: #fff; }}
+    .hero h1 {{ margin: 0 0 12px; font-size: 44px; line-height: 1.05; }}
+    .hero p {{ margin: 0 0 22px; font-size: 18px; opacity: .9; max-width: 720px; }}
+    .cta {{ display:inline-block; padding: 12px 18px; border-radius: 10px; background:#fff; color:#111; text-decoration:none; font-weight: 700; }}
+    .grid {{ display:grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 18px; }}
+    .card {{ padding: 16px; border-radius: 12px; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.12); }}
+    .muted {{ opacity:.85; font-size:14px; margin-top: 10px; }}
+    footer {{ padding: 24px 0; opacity: .7; font-size: 13px; }}
+    @media (max-width: 860px) {{ .grid {{ grid-template-columns:1fr; }} .hero h1 {{ font-size: 34px; }} }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>{title}</h1>
+      <p>{subtitle}</p>
+      <a class="cta" href="#start">Начать</a>
+      <div class="grid">
+        <div class="card"><b>Быстро</b><div class="muted">Готовая структура без лишнего.</div></div>
+        <div class="card"><b>Чисто</b><div class="muted">Аккуратные стили, легко расширять.</div></div>
+        <div class="card"><b>Автономно</b><div class="muted">Supervisor + Reviewer контролируют качество.</div></div>
+      </div>
+      <div class="muted" id="start">Результат сохранён как result.html.</div>
+    </section>
+    <footer>© AgentHub</footer>
+  </div>
+</body>
+</html>
+"""
 
 
-if __name__ == "__main__":
-    try:
-        worker_loop()
-    except KeyboardInterrupt:
-        print("[worker] stopped", flush=True)
+def _analytics_md_fallback(goal: str) -> str:
+    g = goal.strip() or "Analytics report"
+    return f"""# Аналитический отчёт
+
+## Цель
+{g}
+
+## Executive Summary
+Краткое резюме (3–6 предложений): о чём отчёт, главные выводы и что делать дальше.
+
+## Key Findings
+- Наблюдение №1 (факт/аргумент)
+- Наблюдение №2 (факт/аргумент)
+- Наблюдение №3 (факт/аргумент)
+
+## Recommendations
+- Рекомендация №1 (что сделать и почему)
+- Рекомендация №2
+- Рекомендация №3
+
+## Risks / Limitations
+- Ограничение данных / допущение
+- Риск интерпретации
+- Что стоит уточнить дальше
+
+## Next Steps
+- 1–3 конкретных шага продолжения
+"""
+
+
+def _meta(task_id: str, goal: str, mode: Dict[str, Any], artifacts: Dict[str, Any], llm_used: bool) -> Dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "goal": goal,
+        "mode": mode,
+        "generated_at": time.time(),
+        "artifacts": artifacts,
+        "llm_used": llm_used,
+        "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+    }
+
+
+def _llm_enabled() -> bool:
+    """
+    Можно выключить LLM, если нужно:
+      set AGENTHUB_USE_LLM=0
+    По умолчанию: включено.
+    """
+    v = (os.getenv("AGENTHUB_USE_LLM", "1") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _looks_like_html(text: str) -> bool:
+    t = (text or "").lower()
+    return "<html" in t and "</html>" in t
+
+
+# ---------------------------
+# Public API (called by Supervisor)
+# ---------------------------
+def worker_generate_artifacts(task: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Создаёт артефакты по типу продукта.
+    Возвращает dict artifacts.
+    """
+    task_id = task.get("task_id")
+    goal = task.get("goal") or ""
+    mode = task.get("mode") or {}
+    if not isinstance(mode, dict):
+        mode = {}
+
+    product = (mode.get("product") or "site").strip().lower()
+
+    out_dir = _reports_dir(task_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts: Dict[str, Any] = {}
+    llm_used = False
+
+    # 1) строим промпты (это делает prompts.py реально используемым)
+    prompts = build_prompts(task)
+
+    # 2) Если LLM включён, пробуем получить результат от модели
+    llm_text = None
+    if _llm_enabled():
+        llm_text = chat_complete(
+            system=prompts.worker_system,
+            user=prompts.worker_user,
+        )
+        llm_used = bool(llm_text)
+
+    # -----------------------
+    # SITE / VISUAL -> ожидаем HTML
+    # -----------------------
+    if product in ("site", "visual"):
+        html = None
+
+        if llm_text and _looks_like_html(llm_text):
+            html = llm_text
+        else:
+            # fallback на шаблон, если LLM вернул не-HTML или был недоступен
+            html = _site_html_fallback(goal)
+
+        rel = f"reports/{task_id}/result.html"
+        artifacts["result_html"] = _write_text(rel, html)
+
+        artifacts["meta_json"] = _write_json(
+            f"reports/{task_id}/meta.json",
+            _meta(task_id, goal, mode, artifacts, llm_used=llm_used),
+        )
+        return artifacts
+
+    # -----------------------
+    # ANALYTICS -> ожидаем markdown, затем делаем HTML
+    # -----------------------
+    if product == "analytics":
+        md = None
+
+        # Если LLM вернул что-то — используем как markdown (даже если там нет #, reviewer потом проверит)
+        if llm_text and len(llm_text.strip()) > 50:
+            md = llm_text.strip()
+        else:
+            md = _analytics_md_fallback(goal)
+
+        report_md_rel = f"reports/{task_id}/report.md"
+        artifacts["report_md"] = _write_text(report_md_rel, md)
+
+        html = _md_to_html(md, title="Analytics Report")
+        result_html_rel = f"reports/{task_id}/result.html"
+        artifacts["result_html"] = _write_text(result_html_rel, html)
+
+        artifacts["meta_json"] = _write_json(
+            f"reports/{task_id}/meta.json",
+            _meta(task_id, goal, mode, artifacts, llm_used=llm_used),
+        )
+        return artifacts
+
+    # -----------------------
+    # CODE -> пока стабильный детерминированный шаблон (можно расширить позже)
+    # -----------------------
+    if product == "code":
+        proj_dir = out_dir / "project"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+
+        # Небольшая попытка улучшить контент LLM-ом (если он доступен),
+        # но если что — fallback на простые файлы, чтобы не ломать MVP.
+        readme_text = f"# Project\n\nGoal: {goal}\n\nGenerated by AgentHub.\n"
+        main_py_text = 'print("Hello from AgentHub project")\n'
+
+        if llm_text and len(llm_text.strip()) > 80:
+            # Не пытаемся парсить сложный формат, просто добавим как "notes"
+            readme_text = f"# Project\n\nGoal: {goal}\n\n## Notes from LLM\n\n{llm_text.strip()}\n"
+
+        (proj_dir / "README.md").write_text(readme_text, encoding="utf-8")
+        (proj_dir / "main.py").write_text(main_py_text, encoding="utf-8")
+
+        md = f"# Code Project\n\nСгенерирована папка `reports/{task_id}/project/`.\n\n- README.md\n- main.py\n"
+        artifacts["project_dir"] = f"reports/{task_id}/project"
+        artifacts["report_md"] = _write_text(f"reports/{task_id}/report.md", md)
+        artifacts["result_html"] = _write_text(f"reports/{task_id}/result.html", _md_to_html(md, title="Code Project"))
+
+        artifacts["meta_json"] = _write_json(
+            f"reports/{task_id}/meta.json",
+            _meta(task_id, goal, mode, artifacts, llm_used=llm_used),
+        )
+        return artifacts
+
+    # неизвестный product → fallback в site
+    html = _site_html_fallback(goal)
+    artifacts["result_html"] = _write_text(f"reports/{task_id}/result.html", html)
+    artifacts["meta_json"] = _write_json(
+        f"reports/{task_id}/meta.json",
+        _meta(task_id, goal, mode, artifacts, llm_used=llm_used),
+    )
+    return artifacts
+
+
+def worker_fix_artifacts(task: Dict[str, Any], review_report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    MVP авто-фиксер: если reviewer просит добавить секции в analytics — добавляем шаблонно.
+    Для site/code пока фиксы минимальные: просто регенерим.
+    """
+    task_id = task.get("task_id")
+    goal = task.get("goal") or ""
+    mode = task.get("mode") or {}
+    if not isinstance(mode, dict):
+        mode = {}
+
+    product = (mode.get("product") or "site").strip().lower()
+    artifacts = task.get("artifacts") or {}
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+
+    if product != "analytics":
+        # Для site/code/visual — просто пересоберём (там LLM тоже может участвовать)
+        return worker_generate_artifacts(task)
+
+    report_md_rel = artifacts.get("report_md") or f"reports/{task_id}/report.md"
+    abs_md = _repo_root() / str(report_md_rel)
+    if abs_md.exists():
+        md = abs_md.read_text(encoding="utf-8")
+    else:
+        md = _analytics_md_fallback(goal)
+
+    required = [
+        ("## Цель", "## Цель\n" + (goal.strip() or "—") + "\n"),
+        ("## Executive Summary", "## Executive Summary\nДобавь 3–6 предложений резюме.\n"),
+        ("## Key Findings", "## Key Findings\n- Наблюдение №1\n- Наблюдение №2\n"),
+        ("## Recommendations", "## Recommendations\n- Рекомендация №1\n- Рекомендация №2\n"),
+        ("## Risks / Limitations", "## Risks / Limitations\n- Ограничения/риски\n"),
+        ("## Next Steps", "## Next Steps\n- Следующий шаг №1\n"),
+    ]
+
+    fixed = md
+    for marker, block in required:
+        if marker.lower() not in fixed.lower():
+            fixed = fixed.strip() + "\n\n" + block
+
+    issues = review_report.get("issues") if isinstance(review_report, dict) else None
+    if isinstance(issues, list) and issues:
+        fixed += "\n\n## Auto Fix Log\n"
+        for it in issues[:10]:
+            msg = str(it.get("msg") or it)
+            fixed += f"- {msg}\n"
+
+    artifacts["report_md"] = _write_text(report_md_rel, fixed)
+    artifacts["result_html"] = _write_text(
+        f"reports/{task_id}/result.html",
+        _md_to_html(fixed, title="Analytics Report"),
+    )
+    artifacts["meta_json"] = _write_json(
+        f"reports/{task_id}/meta.json",
+        _meta(task_id, goal, mode, artifacts, llm_used=False),
+    )
+    return artifacts
